@@ -1,0 +1,203 @@
+import pygame
+import socket
+import json
+import threading
+from datetime import datetime
+import cv2
+
+class OperatorGUI:
+    def __init__(self):
+        pygame.init()
+        self.screen = pygame.display.set_mode((1024, 768))
+        pygame.display.set_caption("Управление дорожным катком")
+        
+        # Подключение к катку
+        self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.client_socket.connect(('localhost', 65432))  # Заменить на реальный IP
+        
+        # Состояние интерфейса
+        self.current_mode = "idle"
+        self.alerts = []
+        self.camera_image = None
+        self.connection_status = "connected"
+        
+        # Шрифты
+        self.font = pygame.font.SysFont('Arial', 24)
+        self.title_font = pygame.font.SysFont('Arial', 32, bold=True)
+        
+        # Запуск потока для получения данных
+        self.receive_thread = threading.Thread(target=self.receive_data)
+        self.receive_thread.daemon = True
+        self.receive_thread.start()
+        
+        # Запуск основного цикла
+        self.running = True
+        self.main_loop()
+    
+    def send_command(self, command):
+        """Отправка команды катку"""
+        try:
+            self.client_socket.sendall(json.dumps(command).encode())
+        except Exception as e:
+            print(f"Ошибка отправки команды: {e}")
+            self.connection_status = "disconnected"
+    
+    def receive_data(self):
+        """Получение данных от катка"""
+        while self.running:
+            try:
+                data = self.client_socket.recv(4096)
+                if not data:
+                    break
+                    
+                message = json.loads(data.decode())
+                if message.get('type') == 'alert':
+                    self.alerts.append(message)
+                elif message.get('type') == 'status_update':
+                    self.current_mode = message.get('mode', self.current_mode)
+                elif message.get('type') == 'camera_frame':
+                    # Обработка изображения с камеры
+                    pass
+                    
+            except Exception as e:
+                print(f"Ошибка получения данных: {e}")
+                self.connection_status = "disconnected"
+                break
+    
+    def draw_button(self, text, rect, color, action=None):
+        """Отрисовка кнопки"""
+        mouse_pos = pygame.mouse.get_pos()
+        click = pygame.mouse.get_pressed()[0]
+        
+        if rect.collidepoint(mouse_pos):
+            pygame.draw.rect(self.screen, (color[0]-20, color[1]-20, color[2]-20), rect)
+            if click and action:
+                action()
+        else:
+            pygame.draw.rect(self.screen, color, rect)
+        
+        text_surf = self.font.render(text, True, (0, 0, 0))
+        text_rect = text_surf.get_rect(center=rect.center)
+        self.screen.blit(text_surf, text_rect)
+    
+    def draw_status_panel(self):
+        """Отрисовка панели статуса"""
+        panel_rect = pygame.Rect(20, 20, 300, 150)
+        pygame.draw.rect(self.screen, (200, 200, 200), panel_rect, 2)
+        
+        title = self.title_font.render("Статус системы", True, (0, 0, 0))
+        self.screen.blit(title, (panel_rect.x + 10, panel_rect.y + 10))
+        
+        mode_text = self.font.render(f"Режим: {self.current_mode}", True, (0, 0, 0))
+        self.screen.blit(mode_text, (panel_rect.x + 20, panel_rect.y + 50))
+        
+        conn_text = self.font.render(f"Связь: {self.connection_status}", True, (0, 0, 0))
+        self.screen.blit(conn_text, (panel_rect.x + 20, panel_rect.y + 80))
+    
+    def draw_alerts(self):
+        """Отрисовка предупреждений"""
+        panel_rect = pygame.Rect(20, 200, 300, 300)
+        pygame.draw.rect(self.screen, (200, 200, 200), panel_rect, 2)
+        
+        title = self.title_font.render("Предупреждения", True, (0, 0, 0))
+        self.screen.blit(title, (panel_rect.x + 10, panel_rect.y + 10))
+        
+        for i, alert in enumerate(self.alerts[-5:]):  # Показываем последние 5 предупреждений
+            alert_text = self.font.render(alert['message'][:30] + "...", True, (200, 0, 0))
+            self.screen.blit(alert_text, (panel_rect.x + 20, panel_rect.y + 50 + i*30))
+    
+    def draw_manual_controls(self):
+        """Отрисовка элементов ручного управления"""
+        if self.current_mode != "manual":
+            return
+            
+        panel_rect = pygame.Rect(350, 20, 300, 200)
+        pygame.draw.rect(self.screen, (200, 200, 200), panel_rect, 2)
+        
+        title = self.title_font.render("Ручное управление", True, (0, 0, 0))
+        self.screen.blit(title, (panel_rect.x + 10, panel_rect.y + 10))
+        
+        # Кнопки управления
+        forward_btn = pygame.Rect(panel_rect.x + 100, panel_rect.y + 50, 100, 40)
+        self.draw_button("Вперед", forward_btn, (0, 200, 0), 
+                         lambda: self.send_command({'type': 'manual_control', 'left': 0.7, 'right': 0.7}))
+        
+        left_btn = pygame.Rect(panel_rect.x + 30, panel_rect.y + 100, 70, 40)
+        self.draw_button("Влево", left_btn, (200, 200, 0), 
+                         lambda: self.send_command({'type': 'manual_control', 'left': 0.3, 'right': 0.7}))
+        
+        right_btn = pygame.Rect(panel_rect.x + 200, panel_rect.y + 100, 70, 40)
+        self.draw_button("Вправо", right_btn, (200, 200, 0), 
+                         lambda: self.send_command({'type': 'manual_control', 'left': 0.7, 'right': 0.3}))
+        
+        stop_btn = pygame.Rect(panel_rect.x + 100, panel_rect.y + 150, 100, 40)
+        self.draw_button("Стоп", stop_btn, (200, 0, 0), 
+                         lambda: self.send_command({'type': 'manual_control', 'left': 0, 'right': 0}))
+    
+    def draw_mode_controls(self):
+        """Отрисовка переключателей режимов"""
+        panel_rect = pygame.Rect(350, 250, 300, 150)
+        pygame.draw.rect(self.screen, (200, 200, 200), panel_rect, 2)
+        
+        title = self.title_font.render("Режимы работы", True, (0, 0, 0))
+        self.screen.blit(title, (panel_rect.x + 10, panel_rect.y + 10))
+        
+        auto_btn = pygame.Rect(panel_rect.x + 30, panel_rect.y + 50, 100, 40)
+        self.draw_button("Авто", auto_btn, (0, 150, 200), 
+                         lambda: self.send_command({'type': 'mode_change', 'mode': 'auto'}))
+        
+        manual_btn = pygame.Rect(panel_rect.x + 170, panel_rect.y + 50, 100, 40)
+        self.draw_button("Ручной", manual_btn, (200, 150, 0), 
+                         lambda: self.send_command({'type': 'mode_change', 'mode': 'manual'}))
+        
+        idle_btn = pygame.Rect(panel_rect.x + 100, panel_rect.y + 100, 100, 40)
+        self.draw_button("Стоп", idle_btn, (200, 0, 0), 
+                         lambda: self.send_command({'type': 'mode_change', 'mode': 'idle'}))
+    
+    def draw_camera_view(self):
+        """Отрисовка изображения с камеры"""
+        if not self.camera_image:
+            return
+            
+        panel_rect = pygame.Rect(680, 20, 320, 240)
+        pygame.draw.rect(self.screen, (200, 200, 200), panel_rect, 2)
+        
+        title = self.title_font.render("Камера", True, (0, 0, 0))
+        self.screen.blit(title, (panel_rect.x + 10, panel_rect.y + 10))
+        
+        # Конвертация OpenCV изображения в Pygame поверхность
+        camera_surface = pygame.image.frombuffer(
+            self.camera_image.tobytes(), 
+            self.camera_image.shape[1::-1], 
+            "BGR")
+        
+        scaled_surface = pygame.transform.scale(camera_surface, (300, 200))
+        self.screen.blit(scaled_surface, (panel_rect.x + 10, panel_rect.y + 40))
+    
+    def main_loop(self):
+        """Основной цикл интерфейса"""
+        clock = pygame.time.Clock()
+        
+        while self.running:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    self.running = False
+            
+            # Очистка экрана
+            self.screen.fill((240, 240, 240))
+            
+            # Отрисовка элементов интерфейса
+            self.draw_status_panel()
+            self.draw_alerts()
+            self.draw_manual_controls()
+            self.draw_mode_controls()
+            self.draw_camera_view()
+            
+            pygame.display.flip()
+            clock.tick(30)
+        
+        pygame.quit()
+        self.client_socket.close()
+
+if __name__ == "__main__":
+    OperatorGUI()
