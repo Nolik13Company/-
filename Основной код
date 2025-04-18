@@ -1,0 +1,182 @@
+import cv2
+import numpy as np
+import time
+import pygame
+from pyfirmata import Arduino
+from rplidar import RPLidar
+import socket
+import threading
+import json
+from datetime import datetime
+import os
+
+class RoadRoller:
+    def __init__(self):
+        # Инициализация оборудования
+        self.lidar = RPLidar('/dev/ttyUSB0')  # Подключение лидара
+        self.board = Arduino('/dev/ttyACM0')  # Подключение Arduino
+        self.camera = cv2.VideoCapture(0)  # Веб-камера
+        self.motors = {
+            'left': self.board.get_pin('d:9:p'),
+            'right': self.board.get_pin('d:10:p')
+        }
+        
+        # Настройки связи
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.bind(('0.0.0.0', 65432))
+        self.server_socket.listen()
+        
+        # Состояние системы
+        self.mode = "idle"  # idle, auto, manual
+        self.current_task = None
+        self.emergency_stop = False
+        self.obstacle_detected = False
+        self.position = (0, 0)  # Текущие координаты
+        
+        # Запуск потоков
+        self.lidar_thread = threading.Thread(target=self.lidar_scan)
+        self.camera_thread = threading.Thread(target=self.monitor_environment)
+        self.communication_thread = threading.Thread(target=self.handle_communications)
+        
+        self.lidar_thread.start()
+        self.camera_thread.start()
+        self.communication_thread.start()
+        
+    def lidar_scan(self):
+        """Постоянное сканирование окружения с помощью лидара"""
+        try:
+            for scan in self.lidar.iter_scans():
+                if self.mode == "auto" and not self.emergency_stop:
+                    distances = [measurement[2] for measurement in scan]
+                    if any(d < 1000 for d in distances):  # 1000 мм = 1 метр
+                        self.obstacle_detected = True
+                        self.stop_movement()
+                        self.send_alert("Обнаружено препятствие на расстоянии менее 1 метра")
+        except Exception as e:
+            print(f"Ошибка лидара: {e}")
+    
+    def monitor_environment(self):
+        """Мониторинг окружения с помощью камеры"""
+        while True:
+            ret, frame = self.camera.read()
+            if not ret:
+                continue
+                
+            if self.mode == "auto" and not self.emergency_stop:
+                # Обнаружение людей с помощью каскадов Хаара
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_fullbody.xml')
+                faces = face_cascade.detectMultiScale(gray, 1.1, 4)
+                
+                if len(faces) > 0:
+                    self.obstacle_detected = True
+                    self.stop_movement()
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    filename = f"obstacle_{timestamp}.jpg"
+                    cv2.imwrite(filename, frame)
+                    self.send_alert(f"Обнаружен человек на пути. Фото сохранено как {filename}")
+    
+    def handle_communications(self):
+        """Обработка входящих команд от оператора"""
+        while True:
+            conn, addr = self.server_socket.accept()
+            with conn:
+                while True:
+                    data = conn.recv(1024)
+                    if not data:
+                        break
+                        
+                    try:
+                        command = json.loads(data.decode())
+                        self.process_command(command)
+                    except json.JSONDecodeError:
+                        conn.sendall(b"Invalid command format")
+    
+    def process_command(self, command):
+        """Обработка команд от оператора"""
+        if command.get('type') == 'mode_change':
+            self.mode = command['mode']
+            if self.mode == 'auto' and command.get('task'):
+                self.current_task = command['task']
+                self.execute_task()
+        
+        elif command.get('type') == 'manual_control':
+            if self.mode == 'manual':
+                left_speed = command.get('left', 0)
+                right_speed = command.get('right', 0)
+                self.motors['left'].write(left_speed)
+                self.motors['right'].write(right_speed)
+    
+    def execute_task(self):
+        """Выполнение автоматической задачи"""
+        if not self.current_task:
+            return
+            
+        for pass_num in range(self.current_task['passes']):
+            if self.emergency_stop:
+                break
+                
+            for segment in self.current_task['path']:
+                self.move_to(segment['start'])
+                self.compact(segment['start'], segment['end'])
+            
+        self.return_to_base()
+    
+    def move_to(self, target):
+        """Перемещение к целевой точке"""
+        # Упрощенная логика навигации
+        while not self.position_reached(target) and not self.emergency_stop:
+            # Расчет угла и расстояния до цели
+            angle, distance = self.calculate_movement(target)
+            
+            # Преобразование в команды моторов
+            left_speed, right_speed = self.calculate_motor_speeds(angle, distance)
+            
+            self.motors['left'].write(left_speed)
+            self.motors['right'].write(right_speed)
+            
+            time.sleep(0.1)
+        
+        self.stop_movement()
+    
+    def compact(self, start, end):
+        """Процесс укатки участка"""
+        # Упрощенная реализация
+        self.move_to(start)
+        self.move_to(end)
+        # Здесь должна быть более сложная логика с контролем качества укатки
+    
+    def return_to_base(self):
+        """Возврат на базовую позицию"""
+        self.move_to((0, 0))
+        self.mode = 'idle'
+    
+    def stop_movement(self):
+        """Экстренная остановка"""
+        for motor in self.motors.values():
+            motor.write(0)
+    
+    def send_alert(self, message):
+        """Отправка предупреждения оператору"""
+        alert = {
+            'type': 'alert',
+            'message': message,
+            'timestamp': datetime.now().isoformat()
+        }
+        # Реальная реализация должна отправлять через сокет
+        print(f"ALERT: {message}")
+    
+    def cleanup(self):
+        """Очистка ресурсов"""
+        self.lidar.stop()
+        self.lidar.disconnect()
+        self.camera.release()
+        self.board.exit()
+
+if __name__ == "__main__":
+    roller = RoadRoller()
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        roller.cleanup()
